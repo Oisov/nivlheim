@@ -68,6 +68,7 @@ func createAPImuxer(theDB *sql.DB, devmode bool) *http.ServeMux {
 	// API functions that don't require authentication
 	api.Handle("/api/v2/status", &apiMethodStatus{db: theDB})
 	api.HandleFunc("/api/v2/userinfo", apiGetUserInfo)
+	api.HandleFunc("/api/v2/login", (&apiMethodKeys{db: theDB}).login)
 
 	// called by the nivlheim client, ported from perl
 	api.HandleFunc("/cgi-bin/ping", apiPing)

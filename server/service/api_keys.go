@@ -189,41 +189,49 @@ func (vars *apiMethodKeys) create(w http.ResponseWriter, req *http.Request, acce
 		return
 	}
 
+	newKeyID, _, hErr := vars.createKey(access, p)
+	if hErr != nil {
+		http.Error(w, hErr.message, hErr.code)
+		return
+	}
+	w.Header().Set("Location", req.URL.RequestURI()+"/"+strconv.Itoa(newKeyID))
+	http.Error(w, "", http.StatusCreated) // 201 Created
+}
+
+// createKey checks that access may grant p, then stores the key and its IP ranges.
+func (vars *apiMethodKeys) createKey(access *AccessProfile, p *apiKeyParams) (int, string, *httpError) {
 	// If ownerGroup isn't supplied, that's an error
 	if !p.ownerGroup.Valid || strings.TrimSpace(p.ownerGroup.String) == "" {
-		http.Error(w, "Missing required parameter: ownerGroup", http.StatusBadRequest)
-		return
+		return 0, "", &httpError{"Missing required parameter: ownerGroup", http.StatusBadRequest}
 	}
 
 	// ownerGroup must be one of the groups you are a member of
 	if !access.IsMemberOf(p.ownerGroup.String) && !access.IsAdmin() {
-		http.Error(w, "You can't create a key that belongs to a group you aren't a member of: "+
-			p.ownerGroup.String, http.StatusForbidden)
-		return
+		return 0, "", &httpError{"You can't create a key that belongs to a group you aren't a member of: " +
+			p.ownerGroup.String, http.StatusForbidden}
 	}
 
 	// You must also have access to all the groups you attempt to give the key access to
 	for _, g := range p.groups {
 		if !access.HasAccessToGroup(g) {
-			http.Error(w, "You can't create a key that has access to "+
-				"a group you don't have access to: "+g, http.StatusForbidden)
-			return
+			return 0, "", &httpError{"You can't create a key that has access to " +
+				"a group you don't have access to: " + g, http.StatusForbidden}
 		}
 	}
 
 	// If you try to create a key with access to ALL groups, you must have access to all groups
 	if p.allGroups && !access.HasAccessToAllGroups() {
-		http.Error(w, "You don't have access to all groups, so you can't create a key that does.", http.StatusForbidden)
-		return
+		return 0, "", &httpError{"You don't have access to all groups, so you can't create a key that does.", http.StatusForbidden}
 	}
 
 	// Start a transaction
 	var newKeyID int
+	key := utility.RandomStringID()
 	err := utility.RunInTransaction(vars.db, func(tx *sql.Tx) error {
 		// Insert the new key
 		err := tx.QueryRow("INSERT INTO apikeys(key,ownergroup,readonly,comment,expires,groups,all_groups) "+
 			"VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING keyid",
-			utility.RandomStringID(), p.ownerGroup, p.readonly,
+			key, p.ownerGroup, p.readonly,
 			p.comment, p.expires, pq.Array(p.groups), p.allGroups).Scan(&newKeyID)
 		if err != nil {
 			return err
@@ -239,11 +247,9 @@ func (vars *apiMethodKeys) create(w http.ResponseWriter, req *http.Request, acce
 		return nil
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return 0, "", &httpError{err.Error(), http.StatusInternalServerError}
 	}
-	w.Header().Set("Location", req.URL.RequestURI()+"/"+strconv.Itoa(newKeyID))
-	http.Error(w, "", http.StatusCreated) // 201 Created
+	return newKeyID, key, nil
 }
 
 func (vars *apiMethodKeys) update(w http.ResponseWriter, req *http.Request, access *AccessProfile) {
