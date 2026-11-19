@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"nivlheim/utility"
 	"regexp"
-	"sort"
 	"strings"
 
 	"golang.org/x/oauth2"
@@ -167,28 +166,11 @@ func handleOauth2Redirect(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		// Also look up the "drift" user and add the groups from there.
-		// This solution is probably only used by UiO,
-		// but is likely to be harmless in other environments.
-		var otherUsername string
-		if strings.HasSuffix(session.userinfo.Username, "-drift") {
-			otherUsername = session.userinfo.Username[0 : len(session.userinfo.Username)-6]
-		} else {
-			otherUsername = session.userinfo.Username + "-drift"
-		}
-		user2, err := LDAPLookupUser(otherUsername)
-		if err != nil {
+		if err := AddDriftGroups(user); err != nil {
 			log.Printf("Unable to LDAP: %v", err)
 			http.Error(w, "Unable to perform LDAP lookup", http.StatusInternalServerError)
 			return
 		}
-		if user2 != nil {
-			// Add these groups to user's group list
-			user.Groups = append(user.Groups, user2.Groups...)
-		}
-		// Remove duplicate entries
-		user.Groups = utility.RemoveDuplicateStrings(user.Groups)
-		// Sort the group list
-		sort.Strings(user.Groups)
 		session.userinfo.Groups = user.Groups
 
 		// fuzzy logic to determine which group matches the primary affiliation best
@@ -207,30 +189,14 @@ func handleOauth2Redirect(w http.ResponseWriter, req *http.Request) {
 		}
 
 		// If the user is member of a special "admin" group, the user gets admin rights
-		if config.LDAPAdminGroup != "" {
-			for _, gname := range session.userinfo.Groups {
-				if gname == config.LDAPAdminGroup {
-					session.userinfo.IsAdmin = true
-					break
-				}
-			}
+		if isMemberOfAdminGroup(session.userinfo.Groups) {
+			session.userinfo.IsAdmin = true
 		}
 	}
 
 	// Generate an access profile for this user
-	session.AccessProfile = GenerateAccessProfileForUser(
+	session.AccessProfile = accessProfileForLDAPUser(
 		session.userinfo.IsAdmin, session.userinfo.Groups)
-
-	// If the user is a member of one of the "all access" groups, the user gets access to all groups
-outer:
-	for _, gname := range config.AllAccessGroups {
-		for _, g2name := range session.userinfo.Groups {
-			if gname == g2name {
-				session.AccessProfile.allGroups = true
-				break outer
-			}
-		}
-	}
 
 	// Redirect to the page set in redirectAfterLogin.
 	log.Printf("Oauth2: Redirecting to %s", session.RedirectAfterLogin)

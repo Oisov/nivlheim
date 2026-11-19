@@ -1,22 +1,29 @@
 package main
 
 import (
+	"crypto/tls"
 	"log"
+	"net"
 	"net/http"
-	"sort"
 	"strconv"
-	"strings"
+	"sync"
+	"time"
 
 	ldap "github.com/go-ldap/ldap/v3"
-	"nivlheim/utility"
 )
 
 // login creates an API key like POST /api/v2/keys, but authenticates with a
 // username and password (an LDAP bind) instead of a web session.
-// It takes the same form parameters, plus username and password, and requires ipRanges.
+// It takes the same form parameters, plus username and password,
+// and requires ipRanges.
 func (vars *apiMethodKeys) login(w http.ResponseWriter, req *http.Request) {
 	if req.Method != httpPOST {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	clientIP := getRealRemoteAddr(req).String()
+	if tooManyFailedLogins(clientIP) {
+		http.Error(w, "Too many failed logins, try again later", http.StatusTooManyRequests)
 		return
 	}
 	if err := req.ParseForm(); err != nil {
@@ -25,32 +32,52 @@ func (vars *apiMethodKeys) login(w http.ResponseWriter, req *http.Request) {
 	}
 	username := req.PostForm.Get("username")
 	password := req.PostForm.Get("password")
-	if username == "" || password == "" || formValue(req.PostForm, "ipRanges") == "" {
-		http.Error(w, "Missing required parameter: username, password or ipRanges", http.StatusBadRequest)
+	if username == "" || password == "" {
+		http.Error(w, "Missing required parameter: username or password", http.StatusBadRequest)
 		return
 	}
 	p := vars.parseParameters(w, req)
 	if p == nil {
 		return
 	}
-
-	conn, err := ldap.DialURL("ldaps://" + config.LDAPServer)
-	if err != nil {
-		http.Error(w, "Unable to contact LDAP", http.StatusServiceUnavailable)
+	if len(p.ipranges) == 0 {
+		http.Error(w, "Missing required parameter: ipRanges", http.StatusBadRequest)
 		return
 	}
-	defer conn.Close()
-	if err := conn.Bind("uid="+ldap.EscapeDN(username)+","+config.LDAPUserTree, password); err != nil {
+	for _, r := range p.ipranges {
+		if ones, _ := r.Mask.Size(); ones == 0 {
+			http.Error(w, "ipRanges can't include every address: "+r.String(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	user, err := LDAPLookupUser(username)
+	if err != nil {
+		log.Printf("Unable to LDAP: %v", err)
+		http.Error(w, "Unable to perform LDAP lookup", http.StatusServiceUnavailable)
+		return
+	}
+	if user != nil {
+		err = checkLDAPPassword(user.DN, password)
+	}
+	if user == nil || ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
+		recordFailedLogin(clientIP)
 		log.Printf("API key login failed for %s", username)
 		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
 		return
 	}
-
-	access, err := ldapAccessProfile(username)
 	if err != nil {
-		http.Error(w, "Unable to perform LDAP lookup", http.StatusInternalServerError)
+		log.Printf("Unable to LDAP: %v", err)
+		http.Error(w, "Unable to contact LDAP", http.StatusServiceUnavailable)
 		return
 	}
+
+	if err := AddDriftGroups(user); err != nil {
+		log.Printf("Unable to LDAP: %v", err)
+		http.Error(w, "Unable to perform LDAP lookup", http.StatusServiceUnavailable)
+		return
+	}
+	access := accessProfileForLDAPUser(isMemberOfAdminGroup(user.Groups), user.Groups)
 	keyID, key, hErr := vars.createKey(access, p)
 	if hErr != nil {
 		http.Error(w, hErr.message, hErr.code)
@@ -61,34 +88,50 @@ func (vars *apiMethodKeys) login(w http.ResponseWriter, req *http.Request) {
 	returnJSON(w, req, map[string]interface{}{"keyID": keyID, "key": key}, http.StatusCreated)
 }
 
-// ldapAccessProfile gives the same access as a web login (see oauth2login.go):
-// the user's and the -drift account's groups, admin and all-access groups.
-func ldapAccessProfile(username string) (*AccessProfile, error) {
-	other := username + "-drift"
-	if strings.HasSuffix(username, "-drift") {
-		other = strings.TrimSuffix(username, "-drift")
+// checkLDAPPassword binds to LDAP as the given user. It uses the same port as
+// LDAPLookupUser, and StartTLS so the password isn't sent in clear text.
+func checkLDAPPassword(dn string, password string) error {
+	conn, err := ldap.Dial("tcp", net.JoinHostPort(config.LDAPServer, ldap.DefaultLdapPort))
+	if err != nil {
+		return err
 	}
-	var groups []string
-	for _, name := range []string{username, other} {
-		user, err := LDAPLookupUser(name)
-		if err != nil {
-			return nil, err
-		}
-		if user != nil {
-			groups = append(groups, user.Groups...)
-		}
+	defer conn.Close()
+	if err := conn.StartTLS(&tls.Config{ServerName: config.LDAPServer}); err != nil {
+		return err
 	}
-	groups = utility.RemoveDuplicateStrings(groups)
-	sort.Strings(groups)
-	isAdmin := false
-	allGroups := false
-	for _, g := range groups {
-		isAdmin = isAdmin || (config.LDAPAdminGroup != "" && g == config.LDAPAdminGroup)
-		for _, a := range config.AllAccessGroups {
-			allGroups = allGroups || g == a
-		}
+	return conn.Bind(dn, password)
+}
+
+// Failed logins are counted per client IP address, to limit password guessing.
+const maxFailedLogins = 5
+const failedLoginWindow = 15 * time.Minute
+
+type failedLoginCount struct {
+	count int
+	since time.Time
+}
+
+var failedLogins = make(map[string]failedLoginCount)
+var failedLoginsMutex sync.Mutex
+
+func tooManyFailedLogins(ip string) bool {
+	failedLoginsMutex.Lock()
+	defer failedLoginsMutex.Unlock()
+	f := failedLogins[ip]
+	if time.Since(f.since) > failedLoginWindow {
+		delete(failedLogins, ip)
+		return false
 	}
-	access := GenerateAccessProfileForUser(isAdmin, groups)
-	access.allGroups = access.allGroups || allGroups
-	return access, nil
+	return f.count >= maxFailedLogins
+}
+
+func recordFailedLogin(ip string) {
+	failedLoginsMutex.Lock()
+	defer failedLoginsMutex.Unlock()
+	f := failedLogins[ip]
+	if time.Since(f.since) > failedLoginWindow {
+		f = failedLoginCount{since: time.Now()}
+	}
+	f.count++
+	failedLogins[ip] = f
 }
