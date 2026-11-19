@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,11 +22,6 @@ func (vars *apiMethodKeys) login(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	clientIP := getRealRemoteAddr(req).String()
-	if tooManyFailedLogins(clientIP) {
-		http.Error(w, "Too many failed logins, try again later", http.StatusTooManyRequests)
-		return
-	}
 	if err := req.ParseForm(); err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
@@ -36,6 +32,19 @@ func (vars *apiMethodKeys) login(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "Missing required parameter: username or password", http.StatusBadRequest)
 		return
 	}
+	// Each attempt counts as failed until proven otherwise, so that
+	// concurrent requests can't get past the limit.
+	limitKey := strings.ToLower(username)
+	if !reserveLoginAttempt(limitKey) {
+		http.Error(w, "Too many failed logins, try again later", http.StatusTooManyRequests)
+		return
+	}
+	failed := false
+	defer func() {
+		if !failed {
+			releaseLoginAttempt(limitKey)
+		}
+	}()
 	p := vars.parseParameters(w, req)
 	if p == nil {
 		return
@@ -61,7 +70,7 @@ func (vars *apiMethodKeys) login(w http.ResponseWriter, req *http.Request) {
 		err = checkLDAPPassword(user.DN, password)
 	}
 	if user == nil || ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
-		recordFailedLogin(clientIP)
+		failed = true
 		log.Printf("API key login failed for %s", username)
 		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
 		return
@@ -102,7 +111,9 @@ func checkLDAPPassword(dn string, password string) error {
 	return conn.Bind(dn, password)
 }
 
-// Failed logins are counted per client IP address, to limit password guessing.
+// Failed logins are counted per username, to limit password guessing.
+// (Not per client IP, because behind the bundled proxy every request
+// seems to come from the proxy.)
 const maxFailedLogins = 5
 const failedLoginWindow = 15 * time.Minute
 
@@ -113,25 +124,40 @@ type failedLoginCount struct {
 
 var failedLogins = make(map[string]failedLoginCount)
 var failedLoginsMutex sync.Mutex
+var failedLoginsLastPrune time.Time
 
-func tooManyFailedLogins(ip string) bool {
+// reserveLoginAttempt counts an attempt for the key, unless there have been
+// too many failed attempts recently. The caller must call releaseLoginAttempt
+// if the attempt didn't fail.
+func reserveLoginAttempt(key string) bool {
 	failedLoginsMutex.Lock()
 	defer failedLoginsMutex.Unlock()
-	f := failedLogins[ip]
-	if time.Since(f.since) > failedLoginWindow {
-		delete(failedLogins, ip)
-		return false
+	// Remove expired entries now and then, not on every attempt.
+	if time.Since(failedLoginsLastPrune) > time.Minute {
+		for k, f := range failedLogins {
+			if time.Since(f.since) > failedLoginWindow {
+				delete(failedLogins, k)
+			}
+		}
+		failedLoginsLastPrune = time.Now()
 	}
-	return f.count >= maxFailedLogins
-}
-
-func recordFailedLogin(ip string) {
-	failedLoginsMutex.Lock()
-	defer failedLoginsMutex.Unlock()
-	f := failedLogins[ip]
-	if time.Since(f.since) > failedLoginWindow {
+	f, ok := failedLogins[key]
+	if !ok || time.Since(f.since) > failedLoginWindow {
 		f = failedLoginCount{since: time.Now()}
 	}
+	if f.count >= maxFailedLogins {
+		return false
+	}
 	f.count++
-	failedLogins[ip] = f
+	failedLogins[key] = f
+	return true
+}
+
+func releaseLoginAttempt(key string) {
+	failedLoginsMutex.Lock()
+	defer failedLoginsMutex.Unlock()
+	if f, ok := failedLogins[key]; ok && f.count > 0 {
+		f.count--
+		failedLogins[key] = f
+	}
 }
